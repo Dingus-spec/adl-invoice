@@ -221,12 +221,63 @@ test('provisional client text keeps unknowns and the excluded lining out of the 
 
 test('service worker caches quote.js and checks the network first', () => {
   const sw = fs.readFileSync('sw.js', 'utf8');
-  assert.ok(sw.includes("const CACHE = 'adl-invoice-v8'"));
+  assert.ok(sw.includes("const CACHE = 'adl-invoice-v9'"));
   assert.ok(sw.includes('./quote.js'));
   const re = /\/(index\.html|app\.js|pdf\.js|quote\.js|styles\.css|manifest\.json)?$/;
   assert.ok(re.test('/adl-invoice/quote.js'));
   assert.ok(re.test('/quote.js'));
   assert.ok(!re.test('/adl-invoice/vendor/jspdf.umd.min.js'));
+});
+
+test('accepted quote exports sell prices once, and provisional quotes do not', () => {
+  const room = QUOTE.blankRoom({ id: 'bath', kind: 'bathroom', zone: 'extension', name: 'Bathroom', choice: 'fc' });
+  room.lines.find(l => l.key === 'fc').qty = 2;
+  room.lines.find(l => l.key === 'fc').cost = 110;
+  const pending = QUOTE.blankRoom({ id: 'bed', kind: 'standard', zone: 'existing', name: 'Bedroom', retain: 'unknown' });
+  const base = quote({
+    id: 'q1', number: 'Q00007', clientId: 'inlink',
+    client: { id: 'inlink', name: 'Inlink Constructions', pricing: { type: 'hourly', rate: 65 } },
+    jobSite: 'EXAMPLE ONLY', jobLines: 'Keep the existing bedroom sheets',
+    basis: 'supply-fix', framingNearComplete: true, stage: 'final', marginPct: 15, costGst: 'inclusive',
+    depositPct: 50, rooms: [room], delivery: { include: true, qty: 1, cost: 0 }, patch: { rate: 80 },
+    compliance: { contractClass: 'outside', offSiteMajority: false, privateNote: 'PRIVATE-SENTINEL do not print' }
+  });
+  assert.strictEqual(QUOTE.exportPayload(base).ok, false);
+  assert.strictEqual(QUOTE.visibleStatus(base), 'final');
+  base.status = 'accepted';
+  const blocked = quote(Object.assign({}, base, { rooms: [room, pending], status: 'accepted' }));
+  assert.strictEqual(QUOTE.visibleStatus(blocked), 'provisional');
+  assert.strictEqual(QUOTE.exportPayload(blocked).ok, false);
+
+  const built = QUOTE.buildInvoiceFromQuote(base, { id: 'inv1', number: 'INV00083', date: '2026-11-06', rate: 65 });
+  assert.strictEqual(built.ok, true);
+  assert.strictEqual(built.invoice.number, 'INV00083');
+  assert.notStrictEqual(built.invoice.number, base.number);
+  assert.strictEqual(built.invoice.sourceQuoteId, 'q1');
+  assert.strictEqual(built.invoice.sourceQuoteNumber, 'Q00007');
+  assert.strictEqual(built.invoice.client.name, 'Inlink Constructions');
+  assert.strictEqual(built.invoice.jobLines, 'Keep the existing bedroom sheets');
+  assert.ok(built.invoice.supplyItems.some(it => /fibre cement/.test(it.label) && it.sellEx === 23529));
+  assert.ok(built.invoice.supplyItems.every(it => !/water-resistant plasterboard wall lining/.test(it.label)));
+  assert.strictEqual(built.invoice.days.length, 0);
+  const T = INV.totals(built.invoice);
+  assert.strictEqual(T.supply, built.payload.sellEx);
+  assert.strictEqual(T.gst, built.payload.gst);
+  assert.strictEqual(T.total, built.payload.total);
+  assert.strictEqual(T.labour, 0);
+  const priced = QUOTE.priceQuote(base);
+  assert.strictEqual(T.supply, priced.sellEx);
+  assert.strictEqual(T.gst, priced.gst);
+  assert.strictEqual(T.total, priced.total);
+  assert.ok(built.invoice.supplyNote.includes('supply and fix'));
+  assert.ok(built.invoice.supplyNote.includes('Unplanned patching'));
+  assert.ok(built.invoice.supplyNote.includes('$80.00'));
+  assert.ok(!built.invoice.supplyNote.includes('PRIVATE-SENTINEL'));
+  assert.ok(!/QBCC|Schedule 1B|section 33|margin|not a legal certification/i.test(built.invoice.supplyNote));
+  assert.ok(!built.invoice.compliance);
+  const labour = INV.totals({ pricing: { type: 'hourly', rate: 65 }, gstRate: 10, days: [{ hours: 25.5, trades: 1 }], expenses: [{ amount: 28 }], supplyItems: [] });
+  assert.strictEqual(labour.total, 185125);
+  assert.strictEqual(labour.supply, 0);
 });
 
 test('public defaults stay free of bank numbers and seeded invoices', () => {

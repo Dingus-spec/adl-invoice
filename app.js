@@ -156,14 +156,59 @@
     main.append(h('div', { style: 'height:14px' }));
     if (!quotes.length) main.append(h('div', { class: 'empty' }, 'No quotes yet. A quote stays a provisional estimate until you mark it final.'));
     [...quotes].sort((a, b) => numVal(b.number) - numVal(a.number) || (b.created || 0) - (a.created || 0)).forEach(q => {
+      const vis = QUOTE.visibleStatus(clone(q));
       const pres = QUOTE.presentation(clone(q));
       const amount = pres.priced.complete ? F.money(pres.priced.total) : 'Incomplete';
+      const pill = vis === 'accepted' ? 'accepted' : vis === 'final' ? 'final' : 'prov';
+      const pillText = vis === 'accepted' ? 'Accepted' : vis === 'final' ? 'Final' : 'Provisional';
       main.append(h('div', { class: 'inv', onclick: () => openQuote(q.id) },
-        h('div', { class: 'm' }, h('div', { class: 'n' }, q.number || 'Quote', ' ', h('span', { class: 'pill ' + (pres.stage === 'final' ? 'final' : 'prov') }, pres.stage === 'final' ? 'Final' : 'Provisional')),
+        h('div', { class: 'm' }, h('div', { class: 'n' }, q.number || 'Quote', ' ', h('span', { class: 'pill ' + pill }, pillText)),
           h('div', { class: 'c' }, (q.client && q.client.name || '—') + ' · ' + F.dFull(q.date)),
           q.jobSite ? h('div', { class: 'c' }, q.jobSite) : null),
         h('div', { class: 'a' }, amount)));
+      if (vis === 'accepted') main.append(exportQuoteButtons(q));
     });
+  }
+  function linkedInvoice(q) {
+    if (!q) return null;
+    if (q.linkedInvoiceId) { const hit = invoices.find(i => i.id === q.linkedInvoiceId); if (hit) return hit; }
+    return invoices.find(i => i.sourceQuoteId === q.id) || null;
+  }
+  let exportBusy = false;
+  function exportQuoteButtons(q) {
+    const linked = linkedInvoice(q);
+    return h('div', null,
+      h('button', { class: 'btn navy', type: 'button', onclick: e => { e.stopPropagation(); exportQuoteToInvoice(q); } }, 'Export to invoice'),
+      linked ? h('button', { class: 'btn ghost', type: 'button', onclick: e => { e.stopPropagation(); exportQuoteToInvoice(q, { duplicate: true }); } }, 'Create another invoice') : null);
+  }
+  function exportQuoteToInvoice(q, opts) {
+    if (!q || exportBusy) return;
+    if (QUOTE.visibleStatus(q) !== 'accepted') { alert('Export to invoice is only for an accepted quote. A provisional estimate is not accepted scope.'); return; }
+    const linked = linkedInvoice(q);
+    if (linked && !(opts && opts.duplicate)) { toast(linked.number + ' already linked'); listMode = 'invoices'; openInvoice(linked.id); return; }
+    if (opts && opts.duplicate && !confirm('Create another invoice from ' + q.number + '? The quote stays linked to ' + linked.number + '.')) return;
+    const built = QUOTE.buildInvoiceFromQuote(q, { id: uid(), number: S.nextNumber, date: today(), due: S.due, rate: Number(S.rate) || 65 });
+    if (!built.ok) { alert(built.reason); return; }
+    exportBusy = true;
+    try {
+      const inv = built.invoice;
+      inv.created = Date.now();
+      invoices.push(clone(inv));
+      saveI();
+      if (numVal(inv.number) >= numVal(S.nextNumber)) S.nextNumber = incNum(inv.number);
+      const firstQuote = !quotes.some(x => x.id === q.id);
+      if (!linked) { q.linkedInvoiceId = inv.id; q.linkedInvoiceNumber = inv.number; }
+      const copy = clone(q); delete copy._saved;
+      const idx = quotes.findIndex(x => x.id === q.id);
+      if (idx >= 0) quotes[idx] = copy; else quotes.push(copy);
+      saveQ();
+      if (firstQuote && numVal(q.number) >= numVal(S.nextQuoteNumber || 'Q00001')) S.nextQuoteNumber = incNum(q.number);
+      saveS();
+      if (curQ && curQ.id === q.id) { curQ.linkedInvoiceId = q.linkedInvoiceId; curQ.linkedInvoiceNumber = q.linkedInvoiceNumber; curQ._saved = true; dirtyQ = false; }
+      listMode = 'invoices';
+      openInvoice(inv.id);
+      toast('Invoice ' + inv.number + ' from ' + q.number);
+    } finally { exportBusy = false; }
   }
 
   /* ---------- editor ---------- */
@@ -200,7 +245,10 @@
     totalsEl.innerHTML = '';
     const pd = (cur.days || []).reduce((n, d, i) => n + T.lines[i].t * (d.dayType === 'half' ? 0.5 : 1), 0);
     const labLbl = T.P.type === 'day' ? `Labour ${F.hrs(pd)} person-days ex GST` : `Labour ${F.hrs(T.manHours)} ${T.multi ? 'person-hours' : 'hrs'} ex GST`;
-    totalsEl.append(...[h('div', { class: 'l' }, h('span', null, labLbl), h('span', null, F.money(T.labour))),
+    const showLabour = (cur.days || []).length || !T.supply;
+    totalsEl.append(...[
+      showLabour ? h('div', { class: 'l' }, h('span', null, labLbl), h('span', null, F.money(T.labour))) : null,
+      (cur.supplyItems || []).length ? h('div', { class: 'l' }, h('span', null, 'Quoted work ex GST'), h('span', null, F.money(T.supply))) : null,
       h('div', { class: 'l' }, h('span', null, `GST ${T.gstPct}%`), h('span', null, F.money(T.gst))),
       T.exp ? h('div', { class: 'l' }, h('span', null, 'Parking (no extra GST)'), h('span', null, F.money(T.exp))) : null,
       h('div', { class: 'l big' }, h('span', null, 'Balance due'), h('span', null, F.money(T.total)))].filter(Boolean));
@@ -221,6 +269,15 @@
     main.append(h('div', { class: 'card' }, h('h2', null, 'Client & job'), field('Bill to', cSel),
       field('Job / site', bind(inv, 'jobSite', { placeholder: 'e.g. 12 Smith Street fit-out' }, changed)),
       field('Job details (one per line)', bind(inv, 'jobLines', { textarea: true, placeholder: 'Builder or project name\nScope of work\nSigned day sheet attached' }, changed))));
+    if ((inv.supplyItems || []).length) {
+      main.append(h('div', { class: 'card' }, h('h2', null, inv.supplyBasis === 'labour-only' ? 'Quoted work — labour only' : 'Quoted work'),
+        inv.sourceQuoteId ? h('button', { class: 'btn ghost', onclick: () => openQuote(inv.sourceQuoteId) }, 'From quote ' + (inv.sourceQuoteNumber || '')) : null,
+        inv.supplyItems.map(it => h('div', { class: 'item' },
+          h('div', { class: 'hd' }, it.label),
+          h('div', { class: 'exnote' }, (it.qty == null ? '' : it.qty) + ' ' + (it.unit || '')),
+          h('div', null, F.money(Math.round(Number(it.sellEx)) || 0) + ' ex GST'))),
+        inv.supplyNote ? h('div', { class: 'exnote' }, inv.supplyNote) : null));
+    }
     // pricing (from client, editable per invoice)
     if (!inv.pricing) inv.pricing = { type: 'hourly', rate: Number(inv.rate) || 0 };
     const pricingBox = h('div');
@@ -370,7 +427,7 @@
     return fetch('icons/logo.jpg').then(r => r.blob()).then(b => new Promise(res => { const fr = new FileReader(); fr.onload = () => { const i = new Image(); i.onload = () => res(logoCache = { dataUrl: fr.result, w: i.naturalWidth, h: i.naturalHeight }); i.src = fr.result; }; fr.readAsDataURL(b); }));
   }
   async function makePdf() {
-    if (!cur.days.length && !cur.expenses.length) { alert('Add at least one work day first.'); return; }
+    if (!cur.days.length && !cur.expenses.length && !(cur.supplyItems && cur.supplyItems.length)) { alert('Add at least one work day first.'); return; }
     if (persist(true) === false) return;
     toast(bankMissing() ? 'Heads up: bank details are blank — add them in Settings' : 'Making PDF…');
     const atts = [];
@@ -428,7 +485,7 @@
     if (!curQ.number) { alert('Please enter a quote number.'); return false; }
     const clash = quotes.find(q => q.number === curQ.number && q.id !== curQ.id);
     if (clash && !confirm(curQ.number + ' is already used on a quote. Save anyway?')) return false;
-    if (QUOTE.finalBlockers(curQ, QUOTE.priceQuote(curQ)).length) curQ.stage = 'provisional';
+    if (QUOTE.finalBlockers(curQ, QUOTE.priceQuote(curQ)).length) { curQ.stage = 'provisional'; curQ.status = ''; }
     const first = !curQ._saved; curQ._saved = true; curQ.updated = Date.now();
     const rec = clone(curQ); delete rec._saved;
     const i = quotes.findIndex(x => x.id === curQ.id); if (i >= 0) quotes[i] = rec; else quotes.push(rec);
@@ -439,8 +496,8 @@
   }
   let autoQT, qTotals, qStatus, qInternal, qRooms;
   const changedQuote = () => {
-    if (curQ && curQ.stage === 'final' && QUOTE.finalBlockers(curQ, QUOTE.priceQuote(curQ)).length) {
-      curQ.stage = 'provisional'; toast('Reverted to provisional — final conditions are not met');
+    if (curQ && QUOTE.finalBlockers(curQ, QUOTE.priceQuote(curQ)).length && (curQ.stage === 'final' || curQ.status === 'accepted')) {
+      curQ.stage = 'provisional'; curQ.status = ''; toast('Reverted to provisional — this is not accepted scope');
     }
     dirtyQ = true; refreshQuote();
     if (curQ && curQ._saved) { clearTimeout(autoQT); autoQT = setTimeout(() => persistQuote(true), 600); }
@@ -455,8 +512,9 @@
     if (!curQ || !qTotals) return;
     const pres = QUOTE.presentation(curQ);
     const p = pres.priced;
-    if (qStatus) qStatus.textContent = pres.stage === 'final' ? 'Final quote' : 'Provisional estimate';
-    document.querySelectorAll('#qStage button').forEach(b => b.classList.toggle('on', b.dataset.stage === pres.stage));
+    const vis = QUOTE.visibleStatus(curQ);
+    if (qStatus) qStatus.textContent = vis === 'accepted' ? 'Accepted' : vis === 'final' ? 'Final quote' : 'Provisional estimate';
+    document.querySelectorAll('#qStage button').forEach(b => b.classList.toggle('on', b.dataset.stage === vis));
     const nw = document.getElementById('qNumWarn');
     if (nw) { const w = numberWarning(quotes, curQ); nw.textContent = w; nw.style.color = w ? 'var(--amber)' : ''; }
     qTotals.innerHTML = '';
@@ -524,18 +582,31 @@
   }
   views.quote = main => {
     const q = curQ; QUOTE.normQuote(q);
-    if (q.stage === 'final' && QUOTE.finalBlockers(q, QUOTE.priceQuote(q)).length) q.stage = 'provisional';
+    if (QUOTE.finalBlockers(q, QUOTE.priceQuote(q)).length) { q.stage = 'provisional'; q.status = ''; }
     header(q._saved ? q.number : 'New quote', () => go('list'));
     qStatus = h('div', { class: 'muted', style: 'text-align:center;margin-top:6px' }, '');
     const stageSeg = h('div', { class: 'seg', id: 'qStage' },
-      h('button', { type: 'button', 'data-stage': 'provisional', onclick: () => { q.stage = 'provisional'; changedQuote(); } }, 'Provisional'),
+      h('button', { type: 'button', 'data-stage': 'provisional', onclick: () => { q.stage = 'provisional'; q.status = ''; changedQuote(); } }, 'Provisional'),
       h('button', { type: 'button', 'data-stage': 'final', onclick: () => {
         const blockers = QUOTE.finalBlockers(q, QUOTE.priceQuote(q));
-        if (blockers.length) { alert('Not marked final:\n\n' + blockers.join('\n\n')); q.stage = 'provisional'; }
-        else q.stage = 'final';
+        if (blockers.length) { alert('Not marked final:\n\n' + blockers.join('\n\n')); q.stage = 'provisional'; q.status = ''; }
+        else { q.stage = 'final'; q.status = ''; }
         changedQuote();
-      } }, 'Final'));
-    main.append(h('div', { class: 'card' }, stageSeg, qStatus, h('div', { class: 'exnote' }, 'Final waits until framing is near complete, the supply basis is chosen, included lines have quantities and rates, and the deposit check passes. Blank is unknown, not zero.')));
+      } }, 'Final'),
+      h('button', { type: 'button', 'data-stage': 'accepted', onclick: () => {
+        const blockers = QUOTE.finalBlockers(q, QUOTE.priceQuote(q));
+        if (blockers.length || QUOTE.presentation(q).stage !== 'final') {
+          alert('A provisional estimate cannot be accepted.\n\n' + (blockers.join('\n\n') || 'Mark the quote final first.'));
+          q.status = '';
+          if (blockers.length) q.stage = 'provisional';
+          changedQuote();
+          return;
+        }
+        q.stage = 'final'; q.status = 'accepted';
+        const host = $('#view'); host.innerHTML = ''; views.quote(host); changedQuote();
+      } }, 'Accepted'));
+    const exportSlot = QUOTE.visibleStatus(q) === 'accepted' ? exportQuoteButtons(q) : null;
+    main.append(h('div', { class: 'card' }, stageSeg, qStatus, exportSlot, h('div', { class: 'exnote' }, 'Accepted is only for a final quote. A provisional estimate cannot be exported. Blank is unknown, not zero.')));
     const cSel = h('select', { onchange: e => {
       if (e.target.value === '__new') { go('client', { returnToQuote: q }, { force: true }); return; }
       const c = clients.find(x => x.id === e.target.value); q.clientId = c.id; q.client = clone(c); changedQuote();
@@ -620,7 +691,7 @@
   };
   function duplicateQuote(src) {
     curQ = clone(src);
-    Object.assign(curQ, { id: uid(), number: S.nextQuoteNumber || 'Q00001', date: today(), stage: 'provisional', framingNearComplete: false, atts: [], created: Date.now(), _saved: false });
+    Object.assign(curQ, { id: uid(), number: S.nextQuoteNumber || 'Q00001', date: today(), stage: 'provisional', status: '', framingNearComplete: false, atts: [], created: Date.now(), _saved: false, linkedInvoiceId: '', linkedInvoiceNumber: '' });
     curQ.compliance = { contractClass: 'unverified', offSiteMajority: false, privateNote: '' };
     QUOTE.normQuote(curQ); dirtyQ = true; go('quote', null, { force: true }); toast('Copy made — final and the deposit check were reset');
   }
@@ -735,7 +806,7 @@
     } });
     main.append(h('div', { class: 'card' }, h('h2', null, 'Backup'), h('div', { class: 'muted' }, 'Everything is stored only on this phone. Save a backup to Files or email it to yourself now and then.'),
       h('button', { class: 'btn', onclick: exportBackup }, 'Export backup'), imp, h('button', { class: 'btn ghost', onclick: () => imp.click() }, 'Restore from backup')));
-    main.append(h('div', { class: 'muted', style: 'text-align:center;margin-top:16px' }, 'ADL Invoices · works offline · v2'));
+    main.append(h('div', { class: 'muted', style: 'text-align:center;margin-top:16px' }, 'ADL Invoices · works offline · v3'));
   };
   async function exportBackup() {
     const files = await allFiles();
