@@ -22,6 +22,11 @@
       return `${F.dFull(ds[0])} – ${F.dFull(ds[ds.length - 1])}`;
     }
   };
+  function qtyPlain(q) {
+    const n = Number(q);
+    if (!Number.isFinite(n)) return '';
+    return String(Math.round(n * 1000) / 1000);
+  }
   function hoursFromTimes(s, f, brk) {
     if (!s || !f) return null; const [a, b] = s.split(':').map(Number), [c, d] = f.split(':').map(Number);
     let m = (c * 60 + d) - (a * 60 + b); if (m < 0) m += 1440; m -= Number(brk) || 0; return Math.max(0, Math.round(m / 60 * 100) / 100);
@@ -44,9 +49,10 @@
       else { unitC = rateC; amt = Math.round(h * rateC * t); }
       hours += h; manHours += h * t; labour += amt; return { h, t, amt, unitC };
     });
-    const gst = Math.round(labour * gstPct / 100);
+    const supply = (inv.supplyItems || []).reduce((s, it) => s + (Math.round(Number(it.sellEx)) || 0), 0);
+    const gst = Math.round((labour + supply) * gstPct / 100);
     const exp = (inv.expenses || []).reduce((s, e) => s + Math.round((Number(e.amount) || 0) * 100), 0);
-    return { P, rateC, halfC, fullC, gstPct, hours: Math.round(hours * 100) / 100, manHours: Math.round(manHours * 100) / 100, labour, gst, exp, total: labour + gst + exp, lines, multi: (inv.days || []).some(d => tradesOf(d) > 1) };
+    return { P, rateC, halfC, fullC, gstPct, hours: Math.round(hours * 100) / 100, manHours: Math.round(manHours * 100) / 100, labour, supply, gst, exp, total: labour + supply + gst + exp, lines, multi: (inv.days || []).some(d => tradesOf(d) > 1) };
   }
   function labourNote(inv, hasDaySheet) {
     if (inv.labourNote && inv.labourNote.trim()) return inv.labourNote.trim();
@@ -176,6 +182,22 @@
       }
       y += 10;
     }
+    if ((inv.supplyItems || []).length) {
+      const head = inv.supplyBasis === 'labour-only'
+        ? 'Quoted work — labour only. Materials are not included.'
+        : 'Quoted work — supply and fix (labour and materials).';
+      heading(head, '');
+      table([{ w: 292 }, { w: 70, align: 'right' }, { w: 48 }, { w: 94.58, align: 'right' }],
+        ['Description', 'Qty', 'Unit', 'Amount'],
+        inv.supplyItems.map(it => [it.label || '', qtyPlain(it.qty), it.unit || '', F.money(Math.round(Number(it.sellEx)) || 0)]),
+        ['Quoted work total', '', '', F.money(T.supply)], C.blue);
+      y += 8;
+      if (inv.supplyNote && String(inv.supplyNote).trim()) {
+        set('normal', 8, C.txt);
+        split(String(inv.supplyNote).trim(), R - L).forEach(s => { need(12); doc.text(s, L, y); y += 11; });
+        y += 6;
+      }
+    }
     // Parking / expenses
     if ((inv.expenses || []).length) {
       heading('Parking reimbursement — no extra GST', inv.expenseNote || S.expenseNote);
@@ -190,7 +212,13 @@
     y += 12;
 
     // Totals box
-    const tRows = [['Labour ex GST', F.money(T.labour)], [`GST on labour only (${T.gstPct}%)`, F.money(T.gst)]];
+    const tRows = [];
+    if (!(inv.supplyItems || []).length) {
+      tRows.push(['Labour ex GST', F.money(T.labour)], [`GST on labour only (${T.gstPct}%)`, F.money(T.gst)]);
+    } else {
+      if ((inv.days || []).length) tRows.push(['Labour ex GST', F.money(T.labour)]);
+      tRows.push(['Quoted work ex GST', F.money(T.supply)], [`GST (${T.gstPct}%)`, F.money(T.gst)]);
+    }
     if (T.exp) tRows.push(['Parking (no extra GST)', F.money(T.exp)]);
     const tx = 275.2, th = 19.6;
     need(th * (tRows.length + 1) + 10);
@@ -201,7 +229,10 @@
 
     // Payment + supplier
     const pay = [`Payee: ${S.payee || ''}`, `ABN: ${S.abn || ''}`, `Bank: ${S.bank || ''}`, `BSB: ${S.bsb || ''}`, `Account: ${S.account || ''}`, `Reference: ${inv.number}`];
-    let gstNote = `GST of ${F.money(T.gst)} is on labour only.` + (T.exp ? ` Parking of ${F.money(T.exp)} is a reimbursement of the attached receipts.` : '');
+    let gstNote = (inv.supplyItems || []).length
+      ? ((inv.days || []).length ? `GST of ${F.money(T.gst)} is on labour and quoted work.` : `GST of ${F.money(T.gst)} is on the quoted work.`)
+      : `GST of ${F.money(T.gst)} is on labour only.`;
+    if (T.exp) gstNote += ` Parking of ${F.money(T.exp)} is a reimbursement of the attached receipts.`;
     set('normal', 8);
     const colW = 318.9 - L;
     const gnLines = split(gstNote, colW - 12);

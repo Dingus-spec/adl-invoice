@@ -102,6 +102,7 @@
     if (q.gstRate == null || q.gstRate === '') q.gstRate = 10;
     if (!q.basis) q.basis = '';
     if (q.stage !== 'final') q.stage = 'provisional';
+    if (q.status !== 'accepted') q.status = '';
     q.rooms.forEach(syncRoomLines);
     return q;
   }
@@ -370,6 +371,69 @@
     };
   }
 
+  function visibleStatus(quote) {
+    const pres = presentation(quote);
+    if (quote.status === 'accepted' && pres.stage === 'final') return 'accepted';
+    return pres.stage;
+  }
+
+  function commercialNotes(quote) {
+    const pres = presentation(quote);
+    const bits = [basisText(quote)];
+    const omitted = omissionLines(quote, pres.priced);
+    if (omitted.length) bits.push('Not included in the price: ' + omitted.map(o => o.label + ' — ' + o.reason).join(' '));
+    bits.push(patchText(quote));
+    if (pres.stage === 'final') bits.push('Deposit requested: ' + pctText(quote.depositPct) + '% of the total including GST, before commencement.');
+    return bits.filter(Boolean).join('\n');
+  }
+
+  function exportPayload(quote) {
+    const pres = presentation(quote);
+    if (quote.status !== 'accepted' || pres.stage !== 'final') {
+      return { ok: false, reason: 'Only an accepted final quote can be exported. A provisional estimate is not accepted scope.' };
+    }
+    const items = pres.priced.lines.filter(l => l.status === 'priced').map(l => ({
+      label: l.label, qty: Number(l.qty), unit: l.unit || '', sellEx: l.sellEx
+    }));
+    const sellEx = items.reduce((s, it) => s + it.sellEx, 0);
+    const gst = Math.round(sellEx * pres.priced.gstPct / 100);
+    if (sellEx !== pres.priced.sellEx || gst !== pres.priced.gst || sellEx + gst !== pres.priced.total) {
+      return { ok: false, reason: 'Exported lines do not match the quote sell total.' };
+    }
+    return {
+      ok: true, items, sellEx, gst, total: sellEx + gst, gstRate: pres.priced.gstPct,
+      notes: commercialNotes(quote),
+      client: quote.client || {}, clientId: quote.clientId || '',
+      jobSite: quote.jobSite || '', jobLines: quote.jobLines || '',
+      supplyBasis: quote.basis, sourceQuoteId: quote.id, sourceQuoteNumber: quote.number
+    };
+  }
+
+  function buildInvoiceFromQuote(quote, meta) {
+    const payload = exportPayload(quote);
+    if (!payload.ok) return payload;
+    const m = meta || {};
+    const pricing = quote.client && quote.client.pricing
+      ? JSON.parse(JSON.stringify(quote.client.pricing))
+      : { type: 'hourly', rate: m.rate == null ? 65 : m.rate };
+    if (pricing.type !== 'day' && (pricing.rate == null || pricing.rate === '')) pricing.rate = m.rate == null ? 65 : m.rate;
+    return {
+      ok: true,
+      payload,
+      invoice: {
+        id: m.id || '', number: m.number, date: m.date || '', due: m.due || 'On receipt',
+        clientId: payload.clientId, client: JSON.parse(JSON.stringify(payload.client || {})),
+        jobSite: payload.jobSite, jobLines: payload.jobLines, period: '',
+        rate: pricing.rate == null ? (m.rate == null ? 65 : m.rate) : pricing.rate,
+        pricing, gstRate: payload.gstRate, days: [], expenses: [],
+        supplyItems: payload.items, supplyBasis: payload.supplyBasis, supplyNote: payload.notes,
+        flagNote: '', labourNote: '', expenseNote: '',
+        sourceQuoteId: payload.sourceQuoteId, sourceQuoteNumber: payload.sourceQuoteNumber,
+        atts: [], status: 'unpaid'
+      }
+    };
+  }
+
   function clientPlain(model) {
     const parts = [model.title, model.banner, model.basisText, model.framingText, model.totalsText, model.depositText, model.patchText];
     model.lines.forEach(l => parts.push(l.label, l.qtyText, l.amountText, l.note));
@@ -499,6 +563,7 @@
 
   g.QUOTE = {
     LAW, blankRoom, syncRoomLines, normQuote, priceQuote, depositDecision, internalParagraphs,
-    finalBlockers, presentation, clientModel, clientPlain, build, attTitle
+    finalBlockers, presentation, visibleStatus, commercialNotes, exportPayload, buildInvoiceFromQuote,
+    clientModel, clientPlain, build, attTitle
   };
 })(window);

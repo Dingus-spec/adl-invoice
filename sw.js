@@ -1,4 +1,4 @@
-const CACHE = 'adl-invoice-v8';
+const CACHE = 'adl-invoice-v9';
 const ASSETS = ['./', './index.html', './styles.css', './app.js', './pdf.js', './quote.js', './manifest.json',
   './vendor/jspdf.umd.min.js', './icons/logo.jpg', './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 // App shell files: network-first (pick up updates fast), cache fallback when offline.

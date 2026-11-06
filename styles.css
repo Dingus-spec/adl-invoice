@@ -61,6 +61,6 @@ input:focus,select:focus,textarea:focus{outline:2px solid var(--blue);border-col
 .chips{display:flex;flex-wrap:wrap;gap:8px}
 .chip{border:1px solid var(--line);background:#f6f8fa;border-radius:18px;padding:8px 12px;font:inherit;font-size:14px;color:var(--txt);text-align:left}
 .chip.on{background:var(--blue);border-color:var(--blue);color:#fff}
-.pill.prov{background:#fff1dc;color:var(--amber)}.pill.final{background:#dcf3e5;color:var(--green)}
+.pill.prov{background:#fff1dc;color:var(--amber)}.pill.final{background:#dcf3e5;color:var(--green)}.pill.accepted{background:#dce8f8;color:var(--blue)}
 .exnote{color:var(--mut);font-size:13px;margin:6px 0}
 .tag{font-size:12px;font-weight:700;color:var(--amber);margin:2px 0 6px}
