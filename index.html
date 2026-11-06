@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="ADL">
+<meta name="theme-color" content="#1b3a4b">
+<meta name="format-detection" content="telephone=no">
+<title>ADL Plaster</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <button class="back hidden" id="backBtn" aria-label="Back">‹ Back</button>
+  <h1 id="title">Invoices</h1>
+  <span class="spacer"></span>
+</header>
+<main id="view"></main>
+<nav class="tabs" id="tabs">
+  <button data-tab="list" class="on"><span>🧾</span>Invoices</button>
+  <button data-tab="new" class="newtab"><span>＋</span>New</button>
+  <button data-tab="clients"><span>👥</span>Clients</button>
+  <button data-tab="settings"><span>⚙️</span>Settings</button>
+</nav>
+<div id="toast"></div>
+<script src="vendor/jspdf.umd.min.js"></script>
+<script src="pdf.js"></script>
+<script src="quote.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
