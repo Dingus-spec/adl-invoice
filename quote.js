@@ -96,7 +96,17 @@
     if (!q.delivery) q.delivery = { include: true, qty: '', cost: '' };
     if (!q.patch) q.patch = { rate: '' };
     if (!q.rooms) q.rooms = [];
-    if (q.marginPct == null || q.marginPct === '') q.marginPct = 15;
+    if (q.pricingMode !== 'sums') q.pricingMode = 'lines';
+    if (q.pricingMode === 'sums') {
+      q.marginPct = 0;
+      if (!Array.isArray(q.alternatives)) q.alternatives = [];
+      if (!Array.isArray(q.pricedScope)) q.pricedScope = [];
+      if (!Array.isArray(q.unpriced)) q.unpriced = [];
+      if (!Array.isArray(q.exclusions)) q.exclusions = [];
+      if (!Array.isArray(q.paymentSchedule)) q.paymentSchedule = [];
+      const dep = q.paymentSchedule.find(s => s && (s.key === 'deposit' || /commencement/i.test(s.label || '')));
+      if (dep && Number.isFinite(Number(dep.percent))) q.depositPct = Number(dep.percent);
+    } else if (q.marginPct == null || q.marginPct === '') q.marginPct = 15;
     if (q.depositPct == null || q.depositPct === '') q.depositPct = 50;
     if (!q.costGst) q.costGst = 'inclusive';
     if (q.gstRate == null || q.gstRate === '') q.gstRate = 10;
@@ -132,6 +142,7 @@
 
   function priceQuote(quote) {
     normQuote(quote);
+    if (quote.pricingMode === 'sums') return priceSums(quote);
     const marginPct = Number(quote.marginPct);
     const gstPct = Number(quote.gstRate);
     const basis = quote.costGst === 'exclusive' ? 'exclusive' : 'inclusive';
@@ -269,9 +280,75 @@
     return out;
   }
 
+  function moneyCents(n) {
+    if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) return null;
+    const cents = Math.round(n * 100);
+    if (Math.abs(n * 100 - cents) > 1e-4) return null;
+    return cents;
+  }
+  function scheduleValid(schedule) {
+    if (!Array.isArray(schedule) || !schedule.length || schedule.length > 12) return { ok: false, error: 'Payment schedule is missing.' };
+    let sum = 0;
+    for (const s of schedule) {
+      if (!s || typeof s.label !== 'string' || !String(s.label).trim()) return { ok: false, error: 'A payment stage needs a label.' };
+      if (typeof s.percent !== 'number' || !Number.isFinite(s.percent) || s.percent < 0 || s.percent > 100) return { ok: false, error: 'A payment percent is not a finite number from 0 to 100.' };
+      sum += s.percent;
+    }
+    if (Math.abs(sum - 100) > 1e-6) return { ok: false, error: 'Payment percents must add to 100.' };
+    return { ok: true };
+  }
+  function stageAmounts(totalCents, schedule) {
+    const parts = schedule.map(s => {
+      const exact = totalCents * Number(s.percent) / 100;
+      const floor = Math.floor(exact + 1e-9);
+      return { label: s.label, key: s.key || '', percent: Number(s.percent), floor, frac: exact - floor, cents: floor };
+    });
+    let left = totalCents - parts.reduce((s, p) => s + p.cents, 0);
+    const order = parts.map((p, i) => i).sort((a, b) => parts[b].frac - parts[a].frac || a - b);
+    for (let k = 0; left > 0 && k < order.length; k++) { parts[order[k]].cents += 1; left -= 1; }
+    return parts.map(p => ({ label: p.label, key: p.key, percent: p.percent, cents: p.cents }));
+  }
+  function sumsFigures(q) {
+    const alts = q.alternatives || [];
+    const selected = alts.filter(a => a && a.selected);
+    const one = selected.length === 1 ? selected[0] : null;
+    const sellEx = one ? moneyCents(one.sellEx) : null;
+    const gst = one ? moneyCents(one.gst) : null;
+    const total = one ? moneyCents(one.sellInc) : null;
+    const sch = scheduleValid(q.paymentSchedule || []);
+    const stages = one && sch.ok ? stageAmounts(total, q.paymentSchedule) : (q.paymentSchedule || []).map(s => ({ label: s.label, key: s.key || '', percent: Number(s.percent), cents: null }));
+    return { alternatives: alts, selected: one, selectedCount: selected.length, sellEx, gst, total, stages, scheduleOk: sch.ok };
+  }
+  function priceSums(q) {
+    const f = sumsFigures(q);
+    const open = (q.unpriced || []).length > 0 || f.selectedCount !== 1 || !f.scheduleOk;
+    return {
+      lines: [], complete: !open && f.total != null, sellEx: f.sellEx, gst: f.gst, total: f.total,
+      partialTotal: null, costEx: null, marginPct: 0, gstPct: Number(q.gstRate) || 10,
+      marginOk: true, gstOk: true, unknown: f.selectedCount === 1 ? 0 : 1, included: f.selectedCount === 1 ? 1 : 0,
+      pricedCount: f.selectedCount === 1 ? 1 : 0, basis: 'exclusive', sums: f, verified: !open && f.total != null
+    };
+  }
   function finalBlockers(quote, priced) {
     const p = priced || priceQuote(quote);
     const reasons = [];
+    if (quote.pricingMode === 'sums') {
+      if (!quote.framingNearComplete) reasons.push('Framing is not marked near complete. A final quote waits until framing is near complete.');
+      if (quote.basis !== 'supply-fix' && quote.basis !== 'labour-only') reasons.push('Choose supply and fix, or labour only.');
+      const f = p.sums || sumsFigures(quote);
+      if (f.selectedCount === 0) reasons.push('No package option is selected. The options are not added together, and there is no single total.');
+      if (f.selectedCount > 1) reasons.push('More than one package option is selected.');
+      if ((quote.unpriced || []).length) reasons.push('Unpriced scope is still listed. This is not a complete fixed price.');
+      const sch = scheduleValid(quote.paymentSchedule);
+      if (!sch.ok) reasons.push(sch.error);
+      else if (f.selected && f.total != null) {
+        const sum = stageAmounts(f.total, quote.paymentSchedule).reduce((s, x) => s + x.cents, 0);
+        if (sum !== f.total) reasons.push('Payment stages do not add up to the quote total.');
+      }
+      const dep = depositDecision(quote, p);
+      if (!dep.ok) reasons.push(dep.result);
+      return reasons;
+    }
     if (!quote.framingNearComplete) reasons.push('Framing is not marked near complete. A final quote waits until framing is near complete.');
     if (quote.basis !== 'supply-fix' && quote.basis !== 'labour-only') reasons.push('Choose supply and fix, or labour only.');
     if (!p.marginOk) reasons.push('Margin must be 0 or more and under 100. Sell uses cost ex GST divided by (1 − margin).');
@@ -386,7 +463,93 @@
     return 'Supporting document';
   }
 
+  function sumsClientModel(quote) {
+    const pres = presentation(quote);
+    const f = pres.priced.sums || sumsFigures(quote);
+    return {
+      mode: 'sums', stage: pres.stage,
+      title: pres.stage === 'final' ? 'QUOTE' : 'PROVISIONAL ESTIMATE',
+      banner: pres.stage === 'final' ? '' : 'Partial pricing only. Not a complete fixed-price offer. Package options are separate and are not added together.',
+      basisText: basisText(quote),
+      alternatives: (f.alternatives || []).map(a => ({
+        label: a.label, selected: !!a.selected,
+        ex: money(moneyCents(a.sellEx)), gst: money(moneyCents(a.gst)), inc: money(moneyCents(a.sellInc))
+      })),
+      totalText: f.selectedCount === 1 ? ('Selected total including GST ' + money(f.total) + '. Ex GST ' + money(f.sellEx) + '. GST ' + money(f.gst) + '.') : 'No option is selected. There is no single total.',
+      pricedScope: quote.pricedScope || [], unpriced: quote.unpriced || [], exclusions: quote.exclusions || [],
+      stages: f.stages || [],
+      patchText: 'Unforeseen patching needs written approval before any work. No rate is agreed in this draft.'
+    };
+  }
+  function sumsPlain(model) {
+    const parts = [model.title, model.banner, model.basisText, model.totalText, model.patchText];
+    (model.alternatives || []).forEach(a => parts.push(a.label, a.selected ? 'Selected' : 'Not selected', a.ex, a.gst, a.inc));
+    (model.pricedScope || []).forEach(s => parts.push(s));
+    (model.unpriced || []).forEach(s => parts.push('Not priced', s));
+    (model.exclusions || []).forEach(s => parts.push('Excluded unless later agreed', s));
+    (model.stages || []).forEach(s => parts.push(s.label, String(s.percent), s.cents == null ? '' : money(s.cents)));
+    return parts.filter(Boolean).join('\n');
+  }
+  function badImportText(s) { return typeof s !== 'string' || s.length > 4000 || /[<>]/.test(s); }
+  function walkStrings(value, path, errors) {
+    if (typeof value === 'string') { if (badImportText(value)) errors.push(path + ' has unsupported text.'); return; }
+    if (Array.isArray(value)) value.forEach((v, i) => walkStrings(v, path + '[' + i + ']', errors));
+    else if (value && typeof value === 'object') Object.keys(value).forEach(k => walkStrings(value[k], path + '.' + k, errors));
+  }
+  function readQuoteImport(data) {
+    const errors = [];
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return { ok: false, errors: ['The file is not a quote import.'] };
+    if (data.invoices || data.files || data.settings) return { ok: false, errors: ['This file is a full backup. Restore would replace records on this phone. Add one quote only accepts an adl-quote-import file.'] };
+    if (data.documentType !== 'adl-quote-import' || data.schemaVersion !== 1) return { ok: false, errors: ['Unsupported quote import. Expected documentType adl-quote-import and schemaVersion 1.'] };
+    const src = data.quote;
+    if (!src || typeof src !== 'object') return { ok: false, errors: ['The quote object is missing.'] };
+    walkStrings(src, 'quote', errors);
+    if (typeof src.importKey !== 'string' || !/^[A-Za-z0-9._:-]{1,80}$/.test(src.importKey)) errors.push('importKey must be 1 to 80 letters, numbers, dots, colons, underscores or dashes.');
+    if (typeof src.number !== 'string' || !src.number.trim() || src.number.length > 40) errors.push('Quote number is missing.');
+    if (src.pricingMode !== 'sums') errors.push('This import only accepts pricingMode sums.');
+    if (!Array.isArray(src.alternatives) || src.alternatives.length < 1 || src.alternatives.length > 8) errors.push('Provide one to eight package alternatives.');
+    const keys = new Set();
+    let selected = 0;
+    (src.alternatives || []).forEach((a, i) => {
+      if (!a || typeof a !== 'object') { errors.push('Alternative ' + (i + 1) + ' is missing.'); return; }
+      if (badImportText(a.label || '')) errors.push('Alternative ' + (i + 1) + ' needs a plain label.');
+      if (keys.has(a.key)) errors.push('Alternative keys must be unique.');
+      keys.add(a.key);
+      const ex = moneyCents(a.sellEx), gst = moneyCents(a.gst), inc = moneyCents(a.sellInc);
+      if (ex == null || gst == null || inc == null) errors.push('Alternative ' + (i + 1) + ' needs finite ex GST, GST and inc GST amounts with at most two decimal places.');
+      else if (ex + gst !== inc) errors.push('Alternative ' + (i + 1) + ' does not add up: ex GST plus GST must equal the inc GST selling total.');
+      if (a.selected === true) selected += 1;
+      else if (a.selected !== false) errors.push('Alternative ' + (i + 1) + ' must say selected true or false.');
+    });
+    if (selected > 1) errors.push('At most one alternative can be selected. Do not sum the options.');
+    ['pricedScope', 'unpriced', 'exclusions'].forEach(k => { if (src[k] != null && !Array.isArray(src[k])) errors.push(k + ' must be a list of text.'); });
+    const sch = scheduleValid(src.paymentSchedule);
+    if (!sch.ok) errors.push(sch.error);
+    if (src.stage != null && src.stage !== 'provisional' && src.stage !== 'final') errors.push('Stage must be provisional or final.');
+    if (src.basis != null && src.basis !== '' && src.basis !== 'supply-fix' && src.basis !== 'labour-only') errors.push('Basis is not a supported value.');
+    if (errors.length) return { ok: false, errors };
+    const quote = {
+      importKey: src.importKey, number: src.number.trim(), date: src.date || '', stage: src.stage === 'final' ? 'final' : 'provisional',
+      pricingMode: 'sums', basis: src.basis || '', marginPct: 0, gstRate: 10, costGst: 'exclusive',
+      framingNearComplete: src.framingNearComplete === true, jobSite: src.jobSite || '', jobLines: src.jobLines || '',
+      client: { name: '', attention: '', address: '', abn: '', phone: '', email: '' },
+      alternatives: src.alternatives.map(a => ({ key: String(a.key), label: a.label.trim(), sellEx: a.sellEx, gst: a.gst, sellInc: a.sellInc, selected: a.selected === true })),
+      pricedScope: (src.pricedScope || []).map(s => String(s)), unpriced: (src.unpriced || []).map(s => String(s)), exclusions: (src.exclusions || []).map(s => String(s)),
+      paymentSchedule: src.paymentSchedule.map(s => ({ key: String(s.key || ''), label: s.label.trim(), percent: s.percent })),
+      patch: { rate: '' }, rooms: [], delivery: { include: true, qty: '', cost: '' }, atts: [],
+      compliance: { contractClass: 'unverified', offSiteMajority: false, privateNote: (src.compliance && src.compliance.privateNote) || '' }
+    };
+    const cls = src.compliance && src.compliance.contractClass;
+    if (cls === 'regulated' || cls === 'outside' || cls === 'unverified') quote.compliance.contractClass = cls;
+    if (src.compliance && src.compliance.offSiteMajority === true) quote.compliance.offSiteMajority = true;
+    const c = src.client || {};
+    ['name', 'attention', 'address', 'abn', 'phone', 'email'].forEach(k => { if (typeof c[k] === 'string') quote.client[k] = c[k].trim(); });
+    normQuote(quote);
+    if (quote.stage === 'final' && finalBlockers(quote).length) quote.stage = 'provisional';
+    return { ok: true, errors: [], quote };
+  }
   function build(quote, S, atts, logo) {
+    if (quote.pricingMode === 'sums') return buildSums(quote, S, atts, logo);
     const model = clientModel(quote);
     const { jsPDF } = g.jspdf;
     const doc = new jsPDF({ unit: 'pt', format: 'a4', compress: true });
@@ -497,8 +660,75 @@
     return doc;
   }
 
+  function buildSums(quote, S, atts, logo) {
+    const model = sumsClientModel(quote);
+    const { jsPDF } = g.jspdf;
+    const doc = new jsPDF({ unit: 'pt', format: 'a4', compress: true });
+    const W = 595.28, H = 841.89, L = 45.35, R = W - 45.35, BOTTOM = 808;
+    const set = (font, size, color) => { doc.setFont('helvetica', font); doc.setFontSize(size); doc.setTextColor(...(color || C.txt)); };
+    const fill = c => doc.setFillColor(...c);
+    const topBar = () => { fill(C.navy); doc.rect(0, 0, W, 17, 'F'); };
+    let y;
+    const newPage = () => { doc.addPage(); topBar(); y = 45; };
+    const need = h => { if (y + h > BOTTOM) newPage(); };
+    const split = (t, w) => doc.splitTextToSize(String(t || ''), w);
+    const para = (text, size, color, gap) => {
+      if (!text) return;
+      set('normal', size || 9, color || C.txt);
+      split(text, R - L).forEach(s => { need(12); doc.text(s, L, y); y += (gap || 12); });
+    };
+    topBar();
+    if (logo) { const lw = 86, lh = lw * logo.h / logo.w; doc.addImage(logo.dataUrl, 'JPEG', L, 40, lw, lh); }
+    set('normal', 9, C.txt);
+    const addr = [...String(S.address || '').split('\n'), S.abn ? 'ABN ' + S.abn : '', S.phone, S.email].filter(s => s && String(s).trim());
+    addr.forEach((s, i) => doc.text(String(s).trim(), R, 49 + i * 11.5, { align: 'right' }));
+    set('bold', 16, C.navy);
+    doc.text((S.tradingName || '').toUpperCase(), L, 123);
+    doc.text(model.title, R, 123, { align: 'right' });
+    doc.setDrawColor(...C.navy); doc.setLineWidth(1); doc.line(L, 130, R, 130);
+    y = 146;
+    if (model.banner) para(model.banner, 9, C.amber, 11);
+    para(model.basisText, 9, C.txt, 12);
+    para('Site: ' + (quote.jobSite || 'Not set'), 9, C.txt, 12);
+    if (quote.jobLines) para(quote.jobLines, 8, C.txt, 11);
+    y += 6;
+    need(20); set('bold', 11, C.navy); doc.text('Package options', L, y); y += 14;
+    model.alternatives.forEach(a => {
+      para((a.selected ? 'Selected. ' : 'Not selected. ') + a.label, 9, a.selected ? C.txt : C.mut, 12);
+      para('Ex GST ' + a.ex + '. GST ' + a.gst + '. Including GST ' + a.inc + '.', 9, C.txt, 12);
+    });
+    y += 4;
+    para(model.totalText, 10, C.navy, 13);
+    if (model.pricedScope.length) {
+      y += 4; need(18); set('bold', 11, C.navy); doc.text('Priced package', L, y); y += 14;
+      model.pricedScope.forEach(s => para('• ' + s, 8, C.txt, 11));
+    }
+    if (model.unpriced.length) {
+      y += 4; need(18); set('bold', 11, C.navy); doc.text('Not priced — not a complete fixed price', L, y); y += 14;
+      model.unpriced.forEach(s => para('• ' + s, 8, C.amber, 11));
+    }
+    if (model.exclusions.length) {
+      y += 4; need(18); set('bold', 11, C.navy); doc.text('Excluded unless later agreed', L, y); y += 14;
+      model.exclusions.forEach(s => para('• ' + s, 8, C.txt, 11));
+    }
+    y += 4; need(18); set('bold', 11, C.navy); doc.text('Requested payment', L, y); y += 14;
+    para('Requested stages only. This is not a legal certification.', 8, C.mut, 11);
+    model.stages.forEach(s => para(s.percent + '% ' + s.label + (s.cents == null ? '' : ' — ' + money(s.cents)), 9, C.txt, 12));
+    y += 4;
+    para(model.patchText, 9, C.txt, 12);
+    const n = doc.getNumberOfPages();
+    for (let p = 1; p <= n; p++) {
+      doc.setPage(p); fill(C.blue); doc.rect(0, H - 22, W, 22, 'F'); set('normal', 7.5, [255, 255, 255]);
+      doc.text((S.tradingName || '') + '  ·  ' + (quote.number || ''), 38, H - 8.3);
+      doc.text('Page ' + p + ' of ' + n, W - 38, H - 8.3, { align: 'right' });
+    }
+    doc.setProperties({ title: (S.tradingName || '') + ' ' + (quote.number || ''), subject: model.title, author: S.legalName || '', creator: 'ADL Invoices' });
+    return doc;
+  }
+
   g.QUOTE = {
     LAW, blankRoom, syncRoomLines, normQuote, priceQuote, depositDecision, internalParagraphs,
-    finalBlockers, presentation, clientModel, clientPlain, build, attTitle
+    finalBlockers, presentation, clientModel, clientPlain, sumsClientModel, sumsPlain, sumsFigures, stageAmounts,
+    readQuoteImport, build, attTitle
   };
 })(window);

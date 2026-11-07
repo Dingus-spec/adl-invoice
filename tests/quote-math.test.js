@@ -221,12 +221,72 @@ test('provisional client text keeps unknowns and the excluded lining out of the 
 
 test('service worker caches quote.js and checks the network first', () => {
   const sw = fs.readFileSync('sw.js', 'utf8');
-  assert.ok(sw.includes("const CACHE = 'adl-invoice-v8'"));
+  assert.ok(sw.includes("const CACHE = 'adl-invoice-v9'"));
   assert.ok(sw.includes('./quote.js'));
   const re = /\/(index\.html|app\.js|pdf\.js|quote\.js|styles\.css|manifest\.json)?$/;
   assert.ok(re.test('/adl-invoice/quote.js'));
   assert.ok(re.test('/quote.js'));
   assert.ok(!re.test('/adl-invoice/vendor/jspdf.umd.min.js'));
+});
+
+function sumsImport(over) {
+  const quote = Object.assign({
+    importKey: 'example-sums-1', number: 'Q-EXAMPLE-1', date: '2026-11-07', pricingMode: 'sums', stage: 'provisional', basis: '',
+    framingNearComplete: false, jobSite: 'Example Street', jobLines: 'Draft package only.',
+    client: { name: '', attention: '', address: '', abn: '', phone: '', email: '' },
+    alternatives: [
+      { key: 'a', label: 'Option A', sellEx: 1000, gst: 100, sellInc: 1100, selected: false },
+      { key: 'b', label: 'Option B', sellEx: 2000, gst: 200, sellInc: 2200, selected: false }
+    ],
+    pricedScope: ['Named new work in the package'], unpriced: ['Balcony not confirmed'], exclusions: ['Painting'],
+    paymentSchedule: [
+      { key: 'deposit', label: 'Before commencement', percent: 30 },
+      { key: 'sheeting', label: 'After sheeting', percent: 30 },
+      { key: 'setting', label: 'After setting', percent: 30 },
+      { key: 'finish', label: 'After cornice and sanding', percent: 10 }
+    ],
+    compliance: { contractClass: 'unverified', privateNote: 'PRIVATE-SENTINEL' }
+  }, over || {});
+  if (over && over.alternatives) quote.alternatives = over.alternatives;
+  return { documentType: 'adl-quote-import', schemaVersion: 1, quote };
+}
+test('sums-only alternatives stay unadded and selling totals are not remargined', () => {
+  const parsed = QUOTE.readQuoteImport(sumsImport());
+  assert.strictEqual(parsed.ok, true, (parsed.errors || []).join('; '));
+  const q = parsed.quote;
+  assert.strictEqual(q.marginPct, 0);
+  assert.strictEqual(QUOTE.sumsFigures(q).selectedCount, 0);
+  assert.strictEqual(QUOTE.priceQuote(q).total, null);
+  assert.strictEqual(QUOTE.presentation(q).stage, 'provisional');
+  const plain = QUOTE.sumsPlain(QUOTE.sumsClientModel(q));
+  assert.ok(plain.includes('No option is selected'));
+  assert.ok(plain.includes('$1,100.00'));
+  assert.ok(plain.includes('$2,200.00'));
+  assert.ok(!/qty|unit rate|hours|material list/i.test(plain));
+  assert.ok(!plain.includes('PRIVATE-SENTINEL'));
+  q.alternatives[0].selected = true;
+  const f = QUOTE.sumsFigures(q);
+  assert.strictEqual(f.sellEx, 100000);
+  assert.strictEqual(f.gst, 10000);
+  assert.strictEqual(f.total, 110000);
+  const stages = QUOTE.stageAmounts(f.total, q.paymentSchedule);
+  assert.strictEqual(stages.reduce((s, x) => s + x.cents, 0), f.total);
+  assert.strictEqual(stages.map(s => s.percent).join(','), '30,30,30,10');
+  const awkward = QUOTE.stageAmounts(1001, q.paymentSchedule);
+  assert.strictEqual(awkward.reduce((s, x) => s + x.cents, 0), 1001);
+  q.marginPct = 15;
+  QUOTE.normQuote(q);
+  assert.strictEqual(QUOTE.sumsFigures(q).total, 110000);
+  assert.ok(QUOTE.readQuoteImport({ invoices: [], quotes: [] }).ok === false);
+  assert.ok(QUOTE.readQuoteImport(sumsImport({ alternatives: [{ key: 'a', label: 'Bad', sellEx: 10, gst: 1, sellInc: 12, selected: false }] })).ok === false);
+  assert.ok(QUOTE.readQuoteImport(sumsImport({ alternatives: [
+    { key: 'a', label: 'A', sellEx: 1000, gst: 100, sellInc: 1100, selected: true },
+    { key: 'b', label: 'B', sellEx: 2000, gst: 200, sellInc: 2200, selected: true }
+  ] })).ok === false);
+  const nasty = sumsImport(); nasty.quote.jobSite = '<script>';
+  assert.strictEqual(QUOTE.readQuoteImport(nasty).ok, false);
+  const inf = sumsImport(); inf.quote.alternatives[0].sellEx = Infinity;
+  assert.strictEqual(QUOTE.readQuoteImport(inf).ok, false);
 });
 
 test('public defaults stay free of bank numbers and seeded invoices', () => {

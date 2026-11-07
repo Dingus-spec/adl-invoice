@@ -157,13 +157,46 @@
     if (!quotes.length) main.append(h('div', { class: 'empty' }, 'No quotes yet. A quote stays a provisional estimate until you mark it final.'));
     [...quotes].sort((a, b) => numVal(b.number) - numVal(a.number) || (b.created || 0) - (a.created || 0)).forEach(q => {
       const pres = QUOTE.presentation(clone(q));
-      const amount = pres.priced.complete ? F.money(pres.priced.total) : 'Incomplete';
+      const sums = q.pricingMode === 'sums';
+      const amount = sums ? (pres.priced.sums && pres.priced.sums.selectedCount === 1 ? F.money(pres.priced.total) : 'No option chosen') : (pres.priced.complete ? F.money(pres.priced.total) : 'Incomplete');
       main.append(h('div', { class: 'inv', onclick: () => openQuote(q.id) },
         h('div', { class: 'm' }, h('div', { class: 'n' }, q.number || 'Quote', ' ', h('span', { class: 'pill ' + (pres.stage === 'final' ? 'final' : 'prov') }, pres.stage === 'final' ? 'Final' : 'Provisional')),
           h('div', { class: 'c' }, (q.client && q.client.name || '—') + ' · ' + F.dFull(q.date)),
           q.jobSite ? h('div', { class: 'c' }, q.jobSite) : null),
         h('div', { class: 'a' }, amount)));
     });
+    main.append(addQuoteControl());
+  }
+  function addQuoteControl() {
+    const input = h('input', { type: 'file', accept: 'application/json,.json', class: 'add-quote-file', style: 'display:none' });
+    input.addEventListener('change', () => importQuoteFile(input));
+    return h('div', { class: 'card' }, h('h2', null, 'Add one quote'),
+      h('div', { class: 'exnote' }, 'Adds a single quote from a private file. It does not replace invoices, other quotes, clients, photos or settings, and it is not Restore.'),
+      input, h('button', { class: 'btn navy', type: 'button', onclick: () => input.click() }, 'Add one quote'));
+  }
+  function normName(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+  async function importQuoteFile(input) {
+    const f = input.files && input.files[0]; input.value = ''; if (!f) return;
+    let data;
+    try { data = JSON.parse(await f.text()); } catch (e) { alert('That file is not valid JSON.'); return; }
+    const parsed = QUOTE.readQuoteImport(data);
+    if (!parsed.ok) { alert(parsed.errors.join('\n')); return; }
+    const q = parsed.quote;
+    if (quotes.some(x => x.importKey && x.importKey === q.importKey)) { alert('This file was already imported. The quote on this phone was not changed.'); return; }
+    if (quotes.some(x => x.number === q.number)) { alert(q.number + ' is already used by a quote on this phone. Nothing was changed.'); return; }
+    const name = (q.client.name || '').trim();
+    const existing = name ? clients.find(c => normName(c.name) === normName(name)) : null;
+    const preview = ['Add this quote only. Existing invoices, quotes, clients, photos and settings stay.', 'Number: ' + q.number, 'Site: ' + (q.jobSite || 'Not set'),
+      ...q.alternatives.map(a => a.label + ': $' + a.sellInc.toFixed(2) + ' including GST' + (a.selected ? ' (selected)' : ' (not selected)')),
+      'Payment: ' + q.paymentSchedule.map(s => s.percent + '% ' + s.label).join('; '),
+      existing ? 'Client already on this phone. Their saved details will not be changed.' : (name ? 'A new client will be added.' : 'No client name. Billing stays blank.')];
+    if (!confirm(preview.join('\n\n'))) return;
+    if (existing) { q.clientId = existing.id; q.client = clone(existing); }
+    else if (name) { q.clientId = uid(); q.client.id = q.clientId; clients.push(clone(q.client)); saveC(); }
+    q.id = uid(); q.created = Date.now(); q._saved = true;
+    const rec = clone(q); delete rec._saved;
+    quotes.push(rec); saveQ();
+    listMode = 'quotes'; toast('Added ' + q.number); go('list');
   }
 
   /* ---------- editor ---------- */
@@ -461,6 +494,18 @@
     if (nw) { const w = numberWarning(quotes, curQ); nw.textContent = w; nw.style.color = w ? 'var(--amber)' : ''; }
     qTotals.innerHTML = '';
     const rows = [];
+    if (curQ.pricingMode === 'sums') {
+      const f = p.sums;
+      if (f && f.selectedCount === 1) {
+        rows.push(h('div', { class: 'l' }, h('span', null, 'Selected ex GST'), h('span', null, F.money(f.sellEx))));
+        rows.push(h('div', { class: 'l' }, h('span', null, 'GST as entered'), h('span', null, F.money(f.gst))));
+        rows.push(h('div', { class: 'l big' }, h('span', null, 'Including GST'), h('span', null, F.money(f.total))));
+      } else rows.push(h('div', { class: 'l big' }, h('span', null, 'No option chosen'), h('span', null, 'No single total')));
+      qTotals.append(...rows);
+      qTotals.append(h('div', { class: 'muted', style: 'color:#d7e2ea;margin-top:6px' }, 'Selling totals are not recalculated. Margin is not applied.'));
+      if (qInternal) { qInternal.innerHTML = ''; QUOTE.internalParagraphs(curQ, p).forEach(t => qInternal.append(h('p', { style: 'margin:0 0 8px' }, t))); }
+      return;
+    }
     if (!curQ.basis) rows.push(h('div', { class: 'l' }, h('span', null, 'Choose supply and fix, or labour only')));
     if (p.sellEx != null) {
       rows.push(h('div', { class: 'l' }, h('span', null, 'Cost ex GST (input GST removed)'), h('span', null, moneyOr(p.costEx))));
@@ -522,8 +567,41 @@
     });
     refreshQuote();
   }
+  function renderSumsQuote(main) {
+    const q = curQ; QUOTE.normQuote(q);
+    if (q.stage === 'final' && QUOTE.finalBlockers(q, QUOTE.priceQuote(q)).length) q.stage = 'provisional';
+    header(q.number || 'Sums quote', () => go('list'));
+    const figs = QUOTE.sumsFigures(q);
+    main.append(h('div', { class: 'card' }, h('h2', null, 'Package options'),
+      h('div', { class: 'exnote' }, 'Selling totals are used as entered. Margin is not applied, and GST is not added again. Leave every option unselected if the choice is still open. They are not added together.'),
+      figs.alternatives.map(a => h('button', { type: 'button', class: 'chip' + (a.selected ? ' on' : ''), style: 'display:block;width:100%;margin:8px 0;text-align:left', onclick: () => {
+        const turnOn = !a.selected;
+        q.alternatives.forEach(x => { x.selected = false; });
+        a.selected = turnOn;
+        const host = $('#view'); host.innerHTML = ''; renderSumsQuote(host); changedQuote();
+      } }, a.label + ' — ' + F.money(Math.round(a.sellInc * 100)) + ' including GST')),
+      h('div', { class: 'exnote' }, figs.selectedCount === 1 ? 'Selected total ' + F.money(figs.total) + ' including GST.' : 'No option chosen. There is no single total.')));
+    main.append(h('div', { class: 'card' }, h('h2', null, 'Scope'),
+      h('div', { class: 'grp' }, 'Priced package'), (q.pricedScope || []).map(s => h('div', { class: 'exnote' }, '• ' + s)),
+      h('div', { class: 'grp' }, 'Not priced'), (q.unpriced || []).map(s => h('div', { class: 'exnote' }, '• ' + s)),
+      h('div', { class: 'grp' }, 'Excluded unless later agreed'), (q.exclusions || []).map(s => h('div', { class: 'exnote' }, '• ' + s))));
+    const stageRows = figs.selected ? QUOTE.stageAmounts(figs.total, q.paymentSchedule) : q.paymentSchedule.map(s => ({ label: s.label, percent: s.percent, cents: null }));
+    main.append(h('div', { class: 'card' }, h('h2', null, 'Requested payment'),
+      h('div', { class: 'exnote' }, 'Requested stages only. Not a legal certification.'),
+      stageRows.map(s => h('div', { class: 'l' }, h('span', null, s.percent + '% ' + s.label), h('span', null, s.cents == null ? '—' : F.money(s.cents))))));
+    qInternal = h('div');
+    main.append(h('div', { class: 'card warn' }, h('b', null, 'Deposit check — internal only'), qInternal,
+      field('Contract class', bind(q.compliance, 'contractClass', { options: [['unverified', 'Not verified — final locked'], ['regulated', 'Regulated domestic contract'], ['outside', 'Privately verified as outside these rules']] }, changedQuote)),
+      field('Private note (not printed)', bind(q.compliance, 'privateNote', { textarea: true }, changedQuote))));
+    qTotals = h('div');
+    main.append(h('div', { class: 'card totals' }, qTotals));
+    refreshQuote();
+    main.append(h('button', { class: 'btn red', onclick: makeQuotePdf }, 'Create PDF'));
+    main.append(h('button', { class: 'btn navy', onclick: () => { if (persistQuote()) { const host = $('#view'); host.innerHTML = ''; renderSumsQuote(host); } } }, 'Save quote'));
+  }
   views.quote = main => {
     const q = curQ; QUOTE.normQuote(q);
+    if (q.pricingMode === 'sums') { renderSumsQuote(main); return; }
     if (q.stage === 'final' && QUOTE.finalBlockers(q, QUOTE.priceQuote(q)).length) q.stage = 'provisional';
     header(q._saved ? q.number : 'New quote', () => go('list'));
     qStatus = h('div', { class: 'muted', style: 'text-align:center;margin-top:6px' }, '');
@@ -625,7 +703,7 @@
     QUOTE.normQuote(curQ); dirtyQ = true; go('quote', null, { force: true }); toast('Copy made — final and the deposit check were reset');
   }
   async function makeQuotePdf() {
-    if (!curQ.basis) { alert('Choose supply and fix, or labour only, before making a PDF.'); return; }
+    if (curQ.pricingMode !== 'sums' && !curQ.basis) { alert('Choose supply and fix, or labour only, before making a PDF.'); return; }
     if (persistQuote(true) === false) return;
     const pres = QUOTE.presentation(curQ);
     toast(pres.stage === 'final' ? 'Making final quote PDF…' : 'Making provisional estimate…');
@@ -733,8 +811,9 @@
         toast('Backup restored'); go('list');
       } catch (err) { alert('Could not restore: ' + err.message); }
     } });
-    main.append(h('div', { class: 'card' }, h('h2', null, 'Backup'), h('div', { class: 'muted' }, 'Everything is stored only on this phone. Save a backup to Files or email it to yourself now and then.'),
+    main.append(h('div', { class: 'card' }, h('h2', null, 'Backup'), h('div', { class: 'muted' }, 'Everything is stored only on this phone. Save a backup to Files or email it to yourself now and then. Restore replaces the invoices on this phone.'),
       h('button', { class: 'btn', onclick: exportBackup }, 'Export backup'), imp, h('button', { class: 'btn ghost', onclick: () => imp.click() }, 'Restore from backup')));
+    main.append(addQuoteControl());
     main.append(h('div', { class: 'muted', style: 'text-align:center;margin-top:16px' }, 'ADL Invoices · works offline · v2'));
   };
   async function exportBackup() {
@@ -742,7 +821,7 @@
     const used = new Set();
     invoices.forEach(i => (i.atts || []).forEach(a => used.add(a.id)));
     quotes.forEach(q => (q.atts || []).forEach(a => used.add(a.id)));
-    const data = { app: 'adl-invoice', version: 2, exported: new Date().toISOString(), settings: S, clients, invoices, quotes, files: files.filter(f => used.has(f.id)) };
+    const data = { app: 'adl-invoice', version: 3, exported: new Date().toISOString(), settings: S, clients, invoices, quotes, files: files.filter(f => used.has(f.id)) };
     const name = `adl-invoices-backup-${today()}.json`;
     const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
     const file = new File([blob], name, { type: 'application/json' });
